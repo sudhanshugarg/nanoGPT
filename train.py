@@ -21,11 +21,13 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import tiktoken
 
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch import nn
 
 from model import GPTConfig, GPT
 
@@ -69,7 +71,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'mps' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
@@ -95,6 +97,7 @@ if ddp:
     gradient_accumulation_steps //= ddp_world_size
 else:
     # if not ddp, we are running on a single gpu, and one process
+    print("RUNNING ON SINGLE DEVICE WITH 1 PROCESS")
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
@@ -136,12 +139,27 @@ best_val_loss = 1e9
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
+load_meta = False
 meta_vocab_size = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
+    load_meta = True
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+
+# for sampling during training
+if load_meta:
+    stoi, itos = meta['stoi'], meta['itos']
+    encode = lambda s: [stoi[c] for c in s]
+    decode = lambda l: ''.join([itos[i] for i in l])
+else:
+    # ok let's assume gpt-2 encodings by default
+    print("No meta.pkl found, assuming GPT-2 encodings...")
+    enc = tiktoken.get_encoding("gpt2")
+    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+    decode = lambda l: enc.decode(l)
+
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
@@ -241,6 +259,18 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+
+def sample(model: nn.Module):
+    start_ids = encode("\n")
+    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+
+    # run generation
+    with torch.no_grad():
+        with ctx:
+            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            print(decode(y[0].tolist()))
+            print('---------------')
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -262,6 +292,8 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
+        # lets print a small sample also
+        sample(raw_model)
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
