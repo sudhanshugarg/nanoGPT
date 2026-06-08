@@ -1,0 +1,17 @@
+to figure out what goes into each training batch
+the exact list of tokens, and the size, based on block_size
+then, figure out what is X and y, so input and labels
+then, figure out what kind of masking (if any) is applied while training the model
+lets print out exactly what the training data
+looks like
+
+1. lets start with prepare.py. lets print out some of the training rows.
+ - ans: basically, train.bin is a SINGLE numpy array, with a list of ids. These are all integers, and for shakespeare, its about 900K ids.
+ 
+2. then, lets go to train.py, and look at the get_batch method.
+ - looked. here, it takes RANDOM sequences from the train array. So if batch_size is 2, it takes 2 random sequences of 
+ - length sequence_length (i.e. block_size), and then trains the model on it.
+ - the model outputs logits for each of the sequences within each training sample. so for example, if the context
+ length is 10, it will have 10 next token outputs. Each next token is of size 65, i.e. vocab size.
+ 
+3. from there, we should be good

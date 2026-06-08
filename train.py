@@ -21,11 +21,14 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import tiktoken
 
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch import nn
+from torch.nn import functional as F
 
 from model import GPTConfig, GPT
 
@@ -69,7 +72,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'mps' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
@@ -95,6 +98,7 @@ if ddp:
     gradient_accumulation_steps //= ddp_world_size
 else:
     # if not ddp, we are running on a single gpu, and one process
+    print("RUNNING ON SINGLE DEVICE WITH 1 PROCESS")
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
@@ -113,22 +117,72 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+## this is just getting random batches of batch_size to train on.
+## the size is x.shape and y.shape = [batch_size, block_size],
+## and the data is the set of token ids.
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    # Load examples from pickle files
     if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        examples_path = os.path.join(data_dir, 'train_examples.pkl')
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        examples_path = os.path.join(data_dir, 'val_examples.pkl')
+
+    with open(examples_path, 'rb') as f:
+        examples = pickle.load(f)
+
+    # Sample random examples and pad/truncate to block_size
+    padding_token_id = stoi.get('<pad>', 4) if load_meta else 0
+    batch_x = []
+    batch_y = []
+
+    for _ in range(batch_size):
+        # Randomly select an example
+        example = examples[torch.randint(len(examples), (1,)).item()]
+
+        # Truncate to block_size if necessary
+        if len(example) > block_size:
+            example = example[:block_size]
+
+        # Pad to block_size if necessary
+        padded_example = example + [padding_token_id] * (block_size - len(example))
+
+        # Create x and y: y is x shifted by 1
+        x_seq = padded_example
+        y_seq = padded_example[1:] + [padding_token_id]
+
+        batch_x.append(x_seq)
+        batch_y.append(y_seq)
+
+    x = torch.tensor(batch_x, dtype=torch.long)
+    y = torch.tensor(batch_y, dtype=torch.long)
+
+    # Create mask for loss computation: only compute loss after <out> token
+    if load_meta and '<out>' in stoi:
+        out_token_id = stoi['<out>']
+        mask = torch.zeros_like(y, dtype=torch.bool)
+        for batch_idx in range(y.shape[0]):
+            # Find the position of <out> token in this sequence
+            out_positions = (x[batch_idx] == out_token_id).nonzero(as_tuple=True)[0]
+            if len(out_positions) > 0:
+                # Set mask to True for all positions after the last <out> token
+                last_out_pos = out_positions[-1].item()
+                # Only mask positions that are not padding
+                for pos in range(last_out_pos, y.shape[1]):
+                    if y[batch_idx, pos] != padding_token_id:
+                        mask[batch_idx, pos] = True
+    else:
+        # If metadata not available, compute loss for all positions
+        mask = torch.ones_like(y, dtype=torch.bool)
+
+    # print(f"x.shape = {x.shape}, y.shape = {y.shape}")
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        mask = mask.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
-    return x, y
+        mask = mask.to(device)
+    return x, y, mask
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -136,12 +190,47 @@ best_val_loss = 1e9
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
+load_meta = False
 meta_vocab_size = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
+    load_meta = True
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+
+# for sampling during training
+if load_meta:
+    stoi, itos = meta['stoi'], meta['itos']
+    # Identify special tokens from stoi
+    special_tokens = [token for token in stoi.keys() if token.startswith('<') and token.endswith('>')]
+
+    def _encode_func(s):
+        """Encode a string to token ids, treating special tokens like <bos> as single tokens."""
+        tokens = []
+        i = 0
+        while i < len(s):
+            found_special = False
+            for token in special_tokens:
+                if s[i:i+len(token)] == token:
+                    tokens.append(stoi[token])
+                    i += len(token)
+                    found_special = True
+                    break
+            if not found_special:
+                if s[i] in stoi:
+                    tokens.append(stoi[s[i]])
+                i += 1
+        return tokens
+
+    encode = _encode_func
+    decode = lambda l: ''.join([itos.get(i, '<pad>') if isinstance(i, int) else itos.get(int(i), '<pad>') for i in l])
+else:
+    # ok let's assume gpt-2 encodings by default
+    print("No meta.pkl found, assuming GPT-2 encodings...")
+    enc = tiktoken.get_encoding("gpt2")
+    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+    decode = lambda l: enc.decode(l)
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
@@ -219,9 +308,9 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y, mask = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, Y, mask)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -241,13 +330,64 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+
+def sample(model: nn.Module):
+    start_ids = encode("<bos><in>hello<out>")
+    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+
+    # run generation
+    with torch.no_grad():
+        with ctx:
+            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            print(decode(y[0].tolist()))
+            print('---------------')
+
+def print_token_ids(token_ids: np.ndarray, suffix: str = ""):
+    msg1 = f"got {len(token_ids)}"
+    token_msg = ''.join(decode(token_ids))
+    ans = f"{msg1}, token_ids = {token_ids}, tokens = #{token_msg}#, suffix: #{suffix}#"
+    print(ans)
+
+def print_logits(logits: torch.Tensor, X: torch.Tensor, Y: torch.Tensor):
+        batch_sz, context_sz, vocab_sz = logits.shape
+        print(f"logits.shape = {logits.shape}")
+        for i in range(batch_sz):
+            row_logits = logits[i] # [context_sz, vocab_sz]
+            row_token_ids = X[i]
+            for j in range(context_sz):
+                # we are predicitng a next token for each substring
+                # i need the substring, and i need the next letter being predicted, and i need the actual letter.
+                input_token_ids = row_token_ids[:j+1].numpy()
+
+                row_logits_sequence_so_far = row_logits[j]
+                row_logits_sequence_so_far_softmax = F.softmax(row_logits_sequence_so_far, dim=-1).detach().numpy()
+                sorted_logit_token_ids = np.argsort(row_logits_sequence_so_far_softmax)[::-1]
+                top_k_token_ids = sorted_logit_token_ids[:5]
+                #print out each of the letters
+                next_letters = decode(top_k_token_ids)
+                print_token_ids(input_token_ids, ''.join(next_letters))
+
+
+        # token_probs = F.softmax(row_logits, dim=-1).detach().numpy()
+        # top_token_probs = np.argsort(token_probs)[::-1]
+        # top_5_tokens_ids = top_token_probs[:5]
+        # top_5_tokens = decode(top_5_tokens_ids)
+        # print(f"top_token_probs = {top_token_probs}")
+        # print(f"softmax(logits[0][0]) = {F.softmax(logits[0][0], dim=-1)}, top_5_tokens_ids = {top_5_tokens_ids}, top_5_tokens = {top_5_tokens}")
+
 # logging
 if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y, mask = get_batch('train') # fetch the very first batch
+#X.shape = [2, 10], i.e. [batch_size, sequence_length]. X[0] is [1, 10]
+print_token_ids(X[0].numpy())
+print_token_ids(Y[0].numpy())
+print_token_ids(X[1].numpy())
+print_token_ids(Y[1].numpy())
+
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -262,6 +402,8 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
+        # lets print a small sample also
+        sample(raw_model)
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
@@ -282,8 +424,11 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                # Create filename with metrics
+                ckpt_filename = f"ckpt_iter{iter_num}_train{losses['train']:.4f}_val{losses['val']:.4f}.pt"
+                ckpt_path = os.path.join(out_dir, ckpt_filename)
+                print(f"saving checkpoint to {ckpt_path}")
+                torch.save(checkpoint, ckpt_path)
     if iter_num == 0 and eval_only:
         break
 
@@ -297,10 +442,17 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss = model(X, Y, mask)
+
+            # print_logits(logits, X, Y)
+            # print(f"reached line 418"); exit(0)
+
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y, mask = get_batch('train')
+
+
+
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
