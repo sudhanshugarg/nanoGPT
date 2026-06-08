@@ -28,6 +28,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch import nn
+from torch.nn import functional as F
 
 from model import GPTConfig, GPT
 
@@ -116,6 +117,9 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+## this is just getting random batches of batch_size to train on.
+## the size is x.shape and y.shape = [batch_size, block_size],
+## and the data is the set of token ids.
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -124,8 +128,10 @@ def get_batch(split):
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
+    # print(f"len(data) = {len(data)}, block_size = {block_size}, batch_size = {batch_size}, ix = {ix}")
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    # print(f"x.shape = {x.shape}, y.shape = {y.shape}")
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -159,7 +165,6 @@ else:
     enc = tiktoken.get_encoding("gpt2")
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
-
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
@@ -271,6 +276,39 @@ def sample(model: nn.Module):
             print(decode(y[0].tolist()))
             print('---------------')
 
+def print_token_ids(token_ids: np.ndarray, suffix: str = ""):
+    msg1 = f"got {len(token_ids)}"
+    token_msg = ''.join(decode(token_ids))
+    ans = f"{msg1}, token_ids = {token_ids}, tokens = #{token_msg}#, suffix: #{suffix}#"
+    print(ans)
+
+def print_logits(logits: torch.Tensor, X: torch.Tensor, Y: torch.Tensor):
+        batch_sz, context_sz, vocab_sz = logits.shape
+        print(f"logits.shape = {logits.shape}")
+        for i in range(batch_sz):
+            row_logits = logits[i] # [context_sz, vocab_sz]
+            row_token_ids = X[i]
+            for j in range(context_sz):
+                # we are predicitng a next token for each substring
+                # i need the substring, and i need the next letter being predicted, and i need the actual letter.
+                input_token_ids = row_token_ids[:j+1].numpy()
+
+                row_logits_sequence_so_far = row_logits[j]
+                row_logits_sequence_so_far_softmax = F.softmax(row_logits_sequence_so_far, dim=-1).detach().numpy()
+                sorted_logit_token_ids = np.argsort(row_logits_sequence_so_far_softmax)[::-1]
+                top_k_token_ids = sorted_logit_token_ids[:5]
+                #print out each of the letters
+                next_letters = decode(top_k_token_ids)
+                print_token_ids(input_token_ids, ''.join(next_letters))
+
+
+        # token_probs = F.softmax(row_logits, dim=-1).detach().numpy()
+        # top_token_probs = np.argsort(token_probs)[::-1]
+        # top_5_tokens_ids = top_token_probs[:5]
+        # top_5_tokens = decode(top_5_tokens_ids)
+        # print(f"top_token_probs = {top_token_probs}")
+        # print(f"softmax(logits[0][0]) = {F.softmax(logits[0][0], dim=-1)}, top_5_tokens_ids = {top_5_tokens_ids}, top_5_tokens = {top_5_tokens}")
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -278,6 +316,12 @@ if wandb_log and master_process:
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
+#X.shape = [2, 10], i.e. [batch_size, sequence_length]. X[0] is [1, 10]
+print_token_ids(X[0].numpy())
+print_token_ids(Y[0].numpy())
+print_token_ids(X[1].numpy())
+print_token_ids(Y[1].numpy())
+
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -290,7 +334,7 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 1 and master_process:
         losses = estimate_loss()
         # lets print a small sample also
         sample(raw_model)
@@ -330,6 +374,9 @@ while True:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
+            print_logits(logits, X, Y)
+            print(f"reached line 344"); exit(0)
+            
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
