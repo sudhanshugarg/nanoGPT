@@ -29,8 +29,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.data import Dataset, DataLoader
 
 from model import GPTConfig, GPT
+from model_params import compute_model_params
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -72,7 +74,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'mps' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
@@ -117,99 +119,128 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-## this is just getting random batches of batch_size to train on.
-## the size is x.shape and y.shape = [batch_size, block_size],
-## and the data is the set of token ids.
-def get_batch(split):
-    # Load examples from pickle files
-    if split == 'train':
-        examples_path = os.path.join(data_dir, 'train_examples.pkl')
-    else:
-        examples_path = os.path.join(data_dir, 'val_examples.pkl')
 
-    with open(examples_path, 'rb') as f:
-        examples = pickle.load(f)
+# Pre-load all examples into memory
+print("Pre-loading dataset...")
+_data_cache = {}
+for split in ['train', 'val']:
+    examples_path = os.path.join(data_dir, f'{split}_examples.pkl')
+    if os.path.exists(examples_path):
+        with open(examples_path, 'rb') as f:
+            _data_cache[split] = pickle.load(f)
+        print(f"  Loaded {len(_data_cache[split])} {split} examples")
 
-    # Sample random examples and pad/truncate to block_size
-    padding_token_id = stoi.get('<pad>', 4) if load_meta else 0
-    batch_x = []
-    batch_y = []
+class CopyTaskDataset(Dataset):
+    """Efficient dataset for copy task with pre-filtered valid examples"""
+    def __init__(self, examples, stoi, block_size, load_meta=False):
+        self.examples = examples
+        self.stoi = stoi
+        self.block_size = block_size
+        self.load_meta = load_meta
+        self.padding_token_id = stoi.get('<pad>', 4) if load_meta else 0
+        self.out_token_id = stoi.get('<out>', None) if load_meta else None
 
-    batch_count = 0
-    while batch_count < batch_size:
-        # Randomly select an example
-        original_example = examples[torch.randint(len(examples), (1,)).item()]
+        # Pre-filter valid examples (with <out> token not at end)
+        self.valid_indices = []
+        for i, ex in enumerate(examples):
+            if self.out_token_id is not None:
+                try:
+                    out_idx = ex.index(self.out_token_id)
+                    if out_idx < len(ex) - 1:  # <out> not at end
+                        self.valid_indices.append(i)
+                except ValueError:
+                    pass
+            else:
+                self.valid_indices.append(i)
 
-        # Keep original for y_seq, truncate for x_seq if necessary
-        example = original_example.copy()
-        if len(example) > block_size:
-            example = example[:block_size]
+    def __len__(self):
+        return len(self.valid_indices)
 
-        # Find <out> token position if it exists
-        out_token_id = stoi.get('<out>', None) if load_meta else None
-        out_idx = None
-        if out_token_id is not None:
-            try:
-                out_idx = example.index(out_token_id)
-            except ValueError:
-                out_idx = None
+    def __getitem__(self, idx):
+        original_example = self.examples[self.valid_indices[idx]]
 
-        # Skip this example if no valid <out> token or if <out> is at the end
-        if out_idx is None or out_idx == len(example) - 1:
-            continue
+        example = original_example if len(original_example) <= self.block_size else original_example[:self.block_size]
+        out_idx = example.index(self.out_token_id) if self.out_token_id is not None else 0
 
-        batch_count += 1
-
-        # Create x_seq with at least <bos><in>...<out> and a random number of output tokens
-        # Include everything up to and including <out>, plus random output tokens
         remaining_output = example[out_idx + 1:]
-        # Random number of output tokens (at least 1, at most all remaining)
-        num_output_tokens = torch.randint(1, len(remaining_output) + 1, (1,)).item()
+        num_output_tokens = torch.randint(1, len(remaining_output) + 1, (1,)).item() if remaining_output else 1
         x_seq = example[:out_idx + 1] + remaining_output[:num_output_tokens]
 
-        # Create y from original (non-truncated) example shifted by 1 (so y has 1 extra token from example that x doesn't have)
         y_content = original_example[1:len(x_seq) + 1]
-        y_seq = y_content + [padding_token_id] * (block_size - len(y_content))
+        y_seq = y_content + [self.padding_token_id] * (self.block_size - len(y_content))
+        x_seq = x_seq + [self.padding_token_id] * (self.block_size - len(x_seq))
 
-        # Pad x_seq to block_size if necessary
-        x_seq = x_seq + [padding_token_id] * (block_size - len(x_seq))
+        x_tensor = torch.tensor(x_seq[:self.block_size], dtype=torch.long)
+        y_tensor = torch.tensor(y_seq[:self.block_size], dtype=torch.long)
 
-        batch_x.append(x_seq)
-        batch_y.append(y_seq)
+        return x_tensor, y_tensor, out_idx
 
-    x = torch.tensor(batch_x, dtype=torch.long)
-    y = torch.tensor(batch_y, dtype=torch.long)
+def collate_fn(batch):
+    """Collate function to create masks for batch"""
+    x_list, y_list, out_indices = zip(*batch)
+    x = torch.stack(x_list)
+    y = torch.stack(y_list)
 
-    # Create mask for loss computation: only compute loss after <out> token
-    if load_meta and '<out>' in stoi:
-        out_token_id = stoi['<out>']
-        mask = torch.zeros_like(y, dtype=torch.bool)
+    # Create mask (vectorized)
+    mask = torch.zeros_like(y, dtype=torch.bool)
+    out_token_id = stoi.get('<out>', None) if load_meta else None
+    padding_token_id = stoi.get('<pad>', 4) if load_meta else 0
+
+    if load_meta and out_token_id is not None:
+        # Vectorized mask creation
         for batch_idx in range(y.shape[0]):
-            # Find the position of <out> token in this sequence
             out_positions = (x[batch_idx] == out_token_id).nonzero(as_tuple=True)[0]
             if len(out_positions) > 0:
-                # Set mask to True for all positions after the last <out> token
                 last_out_pos = out_positions[-1].item()
-                # Only mask positions that are not padding
-                for pos in range(last_out_pos, y.shape[1]):
-                    if y[batch_idx, pos] != padding_token_id:
-                        mask[batch_idx, pos] = True
+                mask[batch_idx, last_out_pos:] = (y[batch_idx, last_out_pos:] != padding_token_id)
     else:
-        # If metadata not available, compute loss for all positions
         mask = torch.ones_like(y, dtype=torch.bool)
 
-    # print(f"x.shape = {x.shape}, y.shape = {y.shape}")
+    return x, y, mask
+
+def get_batch(split):
+    """Get next batch from DataLoader iterator (initialized after stoi is defined)"""
+    # Initialize dataloaders on first call (after stoi is available)
+    if not hasattr(get_batch, '_iterators'):
+        get_batch._dataloaders = {}
+        for split_name in ['train', 'val']:
+            if split_name in _data_cache:
+                dataset = CopyTaskDataset(_data_cache[split_name], stoi, block_size, load_meta)
+                get_batch._dataloaders[split_name] = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=(split_name == 'train'),
+                    num_workers=8,
+                    pin_memory=True,
+                    prefetch_factor=16,  # Queue up to 16*8=128 batches ahead
+                    collate_fn=collate_fn,
+                )
+        get_batch._iterators = {}
+
+    # Create new iterator if needed
+    if split not in get_batch._iterators or get_batch._iterators[split] is None:
+        get_batch._iterators[split] = iter(get_batch._dataloaders[split])
+
+    try:
+        x, y, mask = next(get_batch._iterators[split])
+    except StopIteration:
+        # Restart iterator when epoch ends
+        get_batch._iterators[split] = iter(get_batch._dataloaders[split])
+        x, y, mask = next(get_batch._iterators[split])
+
+    # Move to device (DataLoader already pinned, so just transfer)
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-        mask = mask.pin_memory().to(device, non_blocking=True)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
         mask = mask.to(device)
+
     return x, y, mask
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
-iter_num = 0
+iter_num = 1
 best_val_loss = 1e9
 
 # attempt to derive vocab_size from the dataset
@@ -304,6 +335,83 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
+
+# Print and save model parameter breakdown
+if master_process:
+    compute_model_params(
+        model.config.vocab_size,
+        model.config.block_size,
+        model.config.n_embd,
+        model.config.n_layer,
+        batch_size=batch_size,
+        bias=model.config.bias,
+        print_breakdown=True
+    )
+
+    # Also save parameters to hyperparams.txt
+    vocab_size = model.config.vocab_size
+    sequence_length = model.config.block_size
+    n_embd = model.config.n_embd
+    n_layer = model.config.n_layer
+
+    token_emb_params = vocab_size * n_embd
+    pos_emb_params = sequence_length * n_embd
+    attention_params = sum([n_embd * (3 * n_embd) + (3 * n_embd if model.config.bias else 0) +
+                           n_embd * n_embd + (n_embd if model.config.bias else 0) for _ in range(n_layer)])
+    mlp_params = sum([n_embd * (4 * n_embd) + (4 * n_embd if model.config.bias else 0) +
+                     (4 * n_embd) * n_embd + (n_embd if model.config.bias else 0) for _ in range(n_layer)])
+    layernorm_params = sum([n_embd * 2 + n_embd * 2 for _ in range(n_layer)]) + n_embd * 2
+    total_params = token_emb_params + pos_emb_params + attention_params + mlp_params + layernorm_params
+    bytes_float32 = total_params * 4
+
+    total_params_val, _, memory_breakdown = compute_model_params(
+        vocab_size, sequence_length, n_embd, n_layer,
+        batch_size=batch_size, bias=model.config.bias, print_breakdown=False
+    )
+
+    hyperparams_str = f"""Model Architecture
+{'='*60}
+Vocabulary Size:     {vocab_size:,}
+Embedding Dimension: {n_embd:,}
+Number of Layers:    {n_layer:,}
+Block Size:          {sequence_length:,}
+Bias:                {model.config.bias}
+
+Model Parameters
+{'='*60}
+Token Embedding:     {token_emb_params:15,} params ({token_emb_params * 4 / (1024**2):8.2f} MB)
+Position Embedding:  {pos_emb_params:15,} params ({pos_emb_params * 4 / (1024**2):8.2f} MB)
+Layer Norms:         {layernorm_params:15,} params ({layernorm_params * 4 / (1024**2):8.2f} MB)
+Attention (x{n_layer}):      {attention_params:15,} params ({attention_params * 4 / (1024**2):8.2f} MB)
+MLP (x{n_layer}):           {mlp_params:15,} params ({mlp_params * 4 / (1024**2):8.2f} MB)
+{'-'*60}
+TOTAL:               {total_params:15,} params ({bytes_float32 / (1024**3):8.2f} GB)
+
+Memory Breakdown (batch_size={batch_size})
+{'='*60}
+Model Weights:       {memory_breakdown['weights'] / (1024**3):8.2f} GB
+Gradients:           {memory_breakdown['gradients'] / (1024**3):8.2f} GB
+Optimizer State:     {memory_breakdown['optimizer_state'] / (1024**3):8.2f} GB
+Activations:         {memory_breakdown['activations'] / (1024**3):8.2f} GB
+KV Cache:            {memory_breakdown['kv_cache'] / (1024**3):8.2f} GB
+{'-'*60}
+TOTAL MEMORY:        {memory_breakdown['total'] / (1024**3):8.2f} GB
+
+Training Configuration
+{'='*60}
+Learning Rate:       {learning_rate}
+Weight Decay:        {weight_decay}
+Max Iterations:      {max_iters:,}
+Batch Size:          {batch_size}
+Block Size:          {block_size}
+Gradient Accumulation: {gradient_accumulation_steps}
+Data Type:           {dtype}
+Compile:             {compile}
+"""
+
+    hyperparams_path = os.path.join(out_dir, 'hyperparams.txt')
+    with open(hyperparams_path, 'w') as f:
+        f.write(hyperparams_str)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -400,113 +508,116 @@ def print_logits(logits: torch.Tensor, X: torch.Tensor, Y: torch.Tensor):
         # print(f"softmax(logits[0][0]) = {F.softmax(logits[0][0], dim=-1)}, top_5_tokens_ids = {top_5_tokens_ids}, top_5_tokens = {top_5_tokens}")
 
 # logging
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+if __name__ == '__main__':
+    if wandb_log and master_process:
+        import wandb
+        wandb.init(project=wandb_project, name=wandb_run_name, config=config, mode='offline')
 
-# training loop
-X, Y, mask = get_batch('train') # fetch the very first batch
-#X.shape = [2, 10], i.e. [batch_size, sequence_length]. X[0] is [1, 10]
-print_token_ids(X[0].numpy())
-print_token_ids(Y[0].numpy())
-print_token_ids(X[1].numpy())
-print_token_ids(Y[1].numpy())
+    # training loop
+    X, Y, mask = get_batch('train') # fetch the very first batch
+    #X.shape = [2, 10], i.e. [batch_size, sequence_length]. X[0] is [1, 10]
+    X2 = X.cpu()
+    Y2 = Y.cpu()
+    print_token_ids(X2[0].numpy())
+    print_token_ids(Y2[0].numpy())
+    print_token_ids(X2[1].numpy())
+    print_token_ids(Y2[1].numpy())
 
-t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
-running_mfu = -1.0
-while True:
+    t0 = time.time()
+    local_iter_num = 0 # number of iterations in the lifetime of this process
+    raw_model = model.module if ddp else model # unwrap DDP container if needed
+    running_mfu = -1.0
+    while True:
 
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        # determine and set the learning rate for this iteration
+        lr = get_lr(iter_num) if decay_lr else learning_rate
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        # lets print a small sample also
-        sample(raw_model)
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                # Create filename with metrics
-                ckpt_filename = f"ckpt_iter{iter_num}_train{losses['train']:.4f}_val{losses['val']:.4f}.pt"
-                ckpt_path = os.path.join(out_dir, ckpt_filename)
-                print(f"saving checkpoint to {ckpt_path}")
-                torch.save(checkpoint, ckpt_path)
-    if iter_num == 0 and eval_only:
-        break
+        # evaluate the loss on train/val sets and write checkpoints
+        if iter_num % eval_interval == 0 and master_process:
+            losses = estimate_loss()
+            # lets print a small sample also
+            sample(raw_model)
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                    "mfu": running_mfu*100, # convert to percentage
+                })
+            if losses['val'] < best_val_loss or always_save_checkpoint:
+                best_val_loss = losses['val']
+                if iter_num > 0:
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    }
+                    # Create filename with metrics
+                    ckpt_filename = f"ckpt_iter{iter_num}_train{losses['train']:.4f}_val{losses['val']:.4f}.pt"
+                    ckpt_path = os.path.join(out_dir, ckpt_filename)
+                    print(f"saving checkpoint to {ckpt_path}")
+                    torch.save(checkpoint, ckpt_path)
+        if iter_num == 0 and eval_only:
+            break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(X, Y, mask)
+        # forward backward update, with optional gradient accumulation to simulate larger batch size
+        # and using the GradScaler if data type is float16
+        for micro_step in range(gradient_accumulation_steps):
+            if ddp:
+                # in DDP training we only need to sync gradients at the last micro step.
+                # the official way to do this is with model.no_sync() context manager, but
+                # I really dislike that this bloats the code and forces us to repeat code
+                # looking at the source of that context manager, it just toggles this variable
+                model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+            with ctx:
+                logits, loss = model(X, Y, mask)
 
-            # print_logits(logits, X, Y)
-            # print(f"reached line 418"); exit(0)
+                # print_logits(logits, X, Y)
+                # print(f"reached line 418"); exit(0)
 
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y, mask = get_batch('train')
+                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            # load next batch (now fast since examples are in memory)
+            X, Y, mask = get_batch('train')
 
 
 
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+            # backward pass, with gradient scaling if training in fp16
+            scaler.scale(loss).backward()
+        # clip the gradient
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # step the optimizer and scaler if training in fp16
+        scaler.step(optimizer)
+        scaler.update()
+        # flush the gradients as soon as we can, no need for this memory anymore
+        optimizer.zero_grad(set_to_none=True)
 
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-    iter_num += 1
-    local_iter_num += 1
+        # timing and logging
+        t1 = time.time()
+        dt = t1 - t0
+        t0 = t1
+        if iter_num % log_interval == 0 and master_process:
+            # get loss as float. note: this is a CPU-GPU sync point
+            # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+            lossf = loss.item() * gradient_accumulation_steps
+            if local_iter_num >= 5: # let the training loop settle a bit
+                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        iter_num += 1
+        local_iter_num += 1
 
-    # termination conditions
-    if iter_num > max_iters:
-        break
+        # termination conditions
+        if iter_num > max_iters:
+            break
 
 if ddp:
     destroy_process_group()
