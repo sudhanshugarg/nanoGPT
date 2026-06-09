@@ -11,10 +11,10 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
-checkpoint_path = "/Users/sudgarg/work/coding/nanoGPT/out-copy3/ckpt_iter7000_train0.0807_val0.2059.pt" # path to checkpoint file, if None will use out_dir/ckpt.pt
-start = "<bos><in>andthenthere<out>" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 3 # number of samples to draw
-max_new_tokens = 20 # number of tokens generated in each sample
+checkpoint_path = "/Users/sudgarg/work/coding/nanoGPT/out-copy4/ckpt_iter10500_train0.0317_val0.1368.pt" # path to checkpoint file, if None will use out_dir/ckpt.pt
+start = "<bos><in>eamceokeamceokeamceok<out>" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+num_samples = 1 # number of samples to draw
+max_new_tokens = 30 # number of tokens generated in each sample
 temperature = 0.4 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 top_k = 5 # retain only the top_k most likely tokens, clamp others to have 0 probability
 seed = 1339
