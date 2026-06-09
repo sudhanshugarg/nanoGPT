@@ -413,24 +413,8 @@ Compile:             {compile}
     with open(hyperparams_path, 'w') as f:
         f.write(hyperparams_str)
 
-# initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None # free up memory
-
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
-
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+# These initializations will happen inside the main guard to avoid
+# re-initialization in multiprocessing worker processes
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -509,6 +493,25 @@ def print_logits(logits: torch.Tensor, X: torch.Tensor, Y: torch.Tensor):
 
 # logging
 if __name__ == '__main__':
+    # initialize a GradScaler. If enabled=False scaler is a no-op
+    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+
+    # optimizer
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    if init_from == 'resume':
+        optimizer.load_state_dict(checkpoint['optimizer'])
+    checkpoint = None # free up memory
+
+    # compile the model
+    if compile:
+        print("compiling the model... (takes a ~minute)")
+        unoptimized_model = model
+        model = torch.compile(model) # requires PyTorch 2.0
+
+    # wrap model into DDP container
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+
     if wandb_log and master_process:
         import wandb
         wandb.init(project=wandb_project, name=wandb_run_name, config=config, mode='offline')
