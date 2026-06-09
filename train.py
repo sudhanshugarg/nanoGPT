@@ -287,131 +287,8 @@ else:
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
 
-# model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
-if init_from == 'scratch':
-    # init a new model from scratch
-    print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
-elif init_from.startswith('gpt2'):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
-model.to(device)
-
-# Print and save model parameter breakdown
-if master_process:
-    compute_model_params(
-        model.config.vocab_size,
-        model.config.block_size,
-        model.config.n_embd,
-        model.config.n_layer,
-        batch_size=batch_size,
-        bias=model.config.bias,
-        print_breakdown=True
-    )
-
-    # Also save parameters to hyperparams.txt
-    vocab_size = model.config.vocab_size
-    sequence_length = model.config.block_size
-    n_embd = model.config.n_embd
-    n_layer = model.config.n_layer
-
-    token_emb_params = vocab_size * n_embd
-    pos_emb_params = sequence_length * n_embd
-    attention_params = sum([n_embd * (3 * n_embd) + (3 * n_embd if model.config.bias else 0) +
-                           n_embd * n_embd + (n_embd if model.config.bias else 0) for _ in range(n_layer)])
-    mlp_params = sum([n_embd * (4 * n_embd) + (4 * n_embd if model.config.bias else 0) +
-                     (4 * n_embd) * n_embd + (n_embd if model.config.bias else 0) for _ in range(n_layer)])
-    layernorm_params = sum([n_embd * 2 + n_embd * 2 for _ in range(n_layer)]) + n_embd * 2
-    total_params = token_emb_params + pos_emb_params + attention_params + mlp_params + layernorm_params
-    bytes_float32 = total_params * 4
-
-    total_params_val, _, memory_breakdown = compute_model_params(
-        vocab_size, sequence_length, n_embd, n_layer,
-        batch_size=batch_size, bias=model.config.bias, print_breakdown=False
-    )
-
-    hyperparams_str = f"""Model Architecture
-{'='*60}
-Vocabulary Size:     {vocab_size:,}
-Embedding Dimension: {n_embd:,}
-Number of Layers:    {n_layer:,}
-Block Size:          {sequence_length:,}
-Bias:                {model.config.bias}
-
-Model Parameters
-{'='*60}
-Token Embedding:     {token_emb_params:15,} params ({token_emb_params * 4 / (1024**2):8.2f} MB)
-Position Embedding:  {pos_emb_params:15,} params ({pos_emb_params * 4 / (1024**2):8.2f} MB)
-Layer Norms:         {layernorm_params:15,} params ({layernorm_params * 4 / (1024**2):8.2f} MB)
-Attention (x{n_layer}):      {attention_params:15,} params ({attention_params * 4 / (1024**2):8.2f} MB)
-MLP (x{n_layer}):           {mlp_params:15,} params ({mlp_params * 4 / (1024**2):8.2f} MB)
-{'-'*60}
-TOTAL:               {total_params:15,} params ({bytes_float32 / (1024**3):8.2f} GB)
-
-Memory Breakdown (batch_size={batch_size})
-{'='*60}
-Model Weights:       {memory_breakdown['weights'] / (1024**3):8.2f} GB
-Gradients:           {memory_breakdown['gradients'] / (1024**3):8.2f} GB
-Optimizer State:     {memory_breakdown['optimizer_state'] / (1024**3):8.2f} GB
-Activations:         {memory_breakdown['activations'] / (1024**3):8.2f} GB
-KV Cache:            {memory_breakdown['kv_cache'] / (1024**3):8.2f} GB
-{'-'*60}
-TOTAL MEMORY:        {memory_breakdown['total'] / (1024**3):8.2f} GB
-
-Training Configuration
-{'='*60}
-Learning Rate:       {learning_rate}
-Weight Decay:        {weight_decay}
-Max Iterations:      {max_iters:,}
-Batch Size:          {batch_size}
-Block Size:          {block_size}
-Gradient Accumulation: {gradient_accumulation_steps}
-Data Type:           {dtype}
-Compile:             {compile}
-"""
-
-    hyperparams_path = os.path.join(out_dir, 'hyperparams.txt')
-    with open(hyperparams_path, 'w') as f:
-        f.write(hyperparams_str)
+# Model initialization will happen inside the main guard to prevent
+# re-initialization in multiprocessing worker processes
 
 # These initializations will happen inside the main guard to avoid
 # re-initialization in multiprocessing worker processes
@@ -493,6 +370,132 @@ def print_logits(logits: torch.Tensor, X: torch.Tensor, Y: torch.Tensor):
 
 # logging
 if __name__ == '__main__':
+    # model init
+    model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+                      bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+    if init_from == 'scratch':
+        # init a new model from scratch
+        print("Initializing a new model from scratch")
+        # determine the vocab size we'll use for from-scratch training
+        if meta_vocab_size is None:
+            print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+        model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
+    elif init_from == 'resume':
+        print(f"Resuming training from {out_dir}")
+        # resume training from a checkpoint.
+        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        checkpoint_model_args = checkpoint['model_args']
+        # force these config attributes to be equal otherwise we can't even resume training
+        # the rest of the attributes (e.g. dropout) can stay as desired from command line
+        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+            model_args[k] = checkpoint_model_args[k]
+        # create the model
+        gptconf = GPTConfig(**model_args)
+        model = GPT(gptconf)
+        state_dict = checkpoint['model']
+        # fix the keys of the state dictionary :(
+        # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+        unwanted_prefix = '_orig_mod.'
+        for k,v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        model.load_state_dict(state_dict)
+        iter_num = checkpoint['iter_num']
+        best_val_loss = checkpoint['best_val_loss']
+    elif init_from.startswith('gpt2'):
+        print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+        # initialize from OpenAI GPT-2 weights
+        override_args = dict(dropout=dropout)
+        model = GPT.from_pretrained(init_from, override_args)
+        # read off the created config params, so we can store them into checkpoint correctly
+        for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+            model_args[k] = getattr(model.config, k)
+    # crop down the model block size if desired, using model surgery
+    if block_size < model.config.block_size:
+        model.crop_block_size(block_size)
+        model_args['block_size'] = block_size # so that the checkpoint will have the right value
+    model.to(device)
+
+    # Print and save model parameter breakdown
+    if master_process:
+        compute_model_params(
+            model.config.vocab_size,
+            model.config.block_size,
+            model.config.n_embd,
+            model.config.n_layer,
+            batch_size=batch_size,
+            bias=model.config.bias,
+            print_breakdown=True
+        )
+
+        # Also save parameters to hyperparams.txt
+        vocab_size = model.config.vocab_size
+        sequence_length = model.config.block_size
+        n_embd = model.config.n_embd
+        n_layer = model.config.n_layer
+
+        token_emb_params = vocab_size * n_embd
+        pos_emb_params = sequence_length * n_embd
+        attention_params = sum([n_embd * (3 * n_embd) + (3 * n_embd if model.config.bias else 0) +
+                               n_embd * n_embd + (n_embd if model.config.bias else 0) for _ in range(n_layer)])
+        mlp_params = sum([n_embd * (4 * n_embd) + (4 * n_embd if model.config.bias else 0) +
+                         (4 * n_embd) * n_embd + (n_embd if model.config.bias else 0) for _ in range(n_layer)])
+        layernorm_params = sum([n_embd * 2 + n_embd * 2 for _ in range(n_layer)]) + n_embd * 2
+        total_params = token_emb_params + pos_emb_params + attention_params + mlp_params + layernorm_params
+        bytes_float32 = total_params * 4
+
+        total_params_val, _, memory_breakdown = compute_model_params(
+            vocab_size, sequence_length, n_embd, n_layer,
+            batch_size=batch_size, bias=model.config.bias, print_breakdown=False
+        )
+
+        hyperparams_str = f"""Model Architecture
+{'='*60}
+Vocabulary Size:     {vocab_size:,}
+Embedding Dimension: {n_embd:,}
+Number of Layers:    {n_layer:,}
+Block Size:          {sequence_length:,}
+Bias:                {model.config.bias}
+
+Model Parameters
+{'='*60}
+Token Embedding:     {token_emb_params:15,} params ({token_emb_params * 4 / (1024**2):8.2f} MB)
+Position Embedding:  {pos_emb_params:15,} params ({pos_emb_params * 4 / (1024**2):8.2f} MB)
+Layer Norms:         {layernorm_params:15,} params ({layernorm_params * 4 / (1024**2):8.2f} MB)
+Attention (x{n_layer}):      {attention_params:15,} params ({attention_params * 4 / (1024**2):8.2f} MB)
+MLP (x{n_layer}):           {mlp_params:15,} params ({mlp_params * 4 / (1024**2):8.2f} MB)
+{'-'*60}
+TOTAL:               {total_params:15,} params ({bytes_float32 / (1024**3):8.2f} GB)
+
+Memory Breakdown (batch_size={batch_size})
+{'='*60}
+Model Weights:       {memory_breakdown['weights'] / (1024**3):8.2f} GB
+Gradients:           {memory_breakdown['gradients'] / (1024**3):8.2f} GB
+Optimizer State:     {memory_breakdown['optimizer_state'] / (1024**3):8.2f} GB
+Activations:         {memory_breakdown['activations'] / (1024**3):8.2f} GB
+KV Cache:            {memory_breakdown['kv_cache'] / (1024**3):8.2f} GB
+{'-'*60}
+TOTAL MEMORY:        {memory_breakdown['total'] / (1024**3):8.2f} GB
+
+Training Configuration
+{'='*60}
+Learning Rate:       {learning_rate}
+Weight Decay:        {weight_decay}
+Max Iterations:      {max_iters:,}
+Batch Size:          {batch_size}
+Block Size:          {block_size}
+Gradient Accumulation: {gradient_accumulation_steps}
+Data Type:           {dtype}
+Compile:             {compile}
+"""
+
+        hyperparams_path = os.path.join(out_dir, 'hyperparams.txt')
+        with open(hyperparams_path, 'w') as f:
+            f.write(hyperparams_str)
+
     # initialize a GradScaler. If enabled=False scaler is a no-op
     scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
