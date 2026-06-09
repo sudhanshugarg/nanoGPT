@@ -135,20 +135,44 @@ def get_batch(split):
     batch_x = []
     batch_y = []
 
-    for _ in range(batch_size):
+    batch_count = 0
+    while batch_count < batch_size:
         # Randomly select an example
-        example = examples[torch.randint(len(examples), (1,)).item()]
+        original_example = examples[torch.randint(len(examples), (1,)).item()]
 
-        # Truncate to block_size if necessary
+        # Keep original for y_seq, truncate for x_seq if necessary
+        example = original_example.copy()
         if len(example) > block_size:
             example = example[:block_size]
 
-        # Pad to block_size if necessary
-        padded_example = example + [padding_token_id] * (block_size - len(example))
+        # Find <out> token position if it exists
+        out_token_id = stoi.get('<out>', None) if load_meta else None
+        out_idx = None
+        if out_token_id is not None:
+            try:
+                out_idx = example.index(out_token_id)
+            except ValueError:
+                out_idx = None
 
-        # Create x and y: y is x shifted by 1
-        x_seq = padded_example
-        y_seq = padded_example[1:] + [padding_token_id]
+        # Skip this example if no valid <out> token or if <out> is at the end
+        if out_idx is None or out_idx == len(example) - 1:
+            continue
+
+        batch_count += 1
+
+        # Create x_seq with at least <bos><in>...<out> and a random number of output tokens
+        # Include everything up to and including <out>, plus random output tokens
+        remaining_output = example[out_idx + 1:]
+        # Random number of output tokens (at least 1, at most all remaining)
+        num_output_tokens = torch.randint(1, len(remaining_output) + 1, (1,)).item()
+        x_seq = example[:out_idx + 1] + remaining_output[:num_output_tokens]
+
+        # Create y from original (non-truncated) example shifted by 1 (so y has 1 extra token from example that x doesn't have)
+        y_content = original_example[1:len(x_seq) + 1]
+        y_seq = y_content + [padding_token_id] * (block_size - len(y_content))
+
+        # Pad x_seq to block_size if necessary
+        x_seq = x_seq + [padding_token_id] * (block_size - len(x_seq))
 
         batch_x.append(x_seq)
         batch_y.append(y_seq)

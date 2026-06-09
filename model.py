@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import numpy as np
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -308,28 +309,56 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, decode=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+
+        Args:
+            idx: LongTensor of shape (b,t) - conditioning sequence
+            max_new_tokens: number of tokens to generate
+            temperature: temperature for sampling
+            top_k: if set, only consider top_k tokens
+            decode: optional function to decode token ids to text, will be called after each token
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
+            if decode is not None:
+                print(f"predicting next token for {idx_cond.shape}")
+                print(f"tokens=#{decode(idx_cond)}#")
+            
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
+            # print(logits.shape)
+            # arr = logits.to('cpu').detach().numpy()
+            # print(arr)
+            # print(torch.max(logits))
             # optionally crop the logits to only the top k options
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                v, indices = torch.topk(logits, min(top_k, logits.size(-1)))
+
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
+
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
+            probs_values, probs_indices = torch.sort(probs[0], descending=True)
+
+            if decode:
+                print(decode(probs_indices[:top_k]))
+                print(probs_values[:top_k])             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
+
+            input("key...")
+
+            # Decode and print the new token if decode function is provided
+            if decode is not None:
+                new_token_text = decode([idx_next[0, -1].item()])
+                print(new_token_text, end='', flush=True)
 
         return idx
